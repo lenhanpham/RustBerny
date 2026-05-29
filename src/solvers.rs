@@ -1,6 +1,6 @@
 //! Solver interface for energy and gradient evaluation.
 
-use crate::geometry::Geometry;
+use crate::geometry::{Geometry, ANGSTROM};
 
 /// Wraps any energy function with finite-difference gradients.
 pub struct GenericSolver<F>
@@ -56,9 +56,30 @@ where
                 gradients[i][j] = (energies[0] / 12.0 - 2.0 * energies[1] / 3.0
                     + 2.0 * energies[2] / 3.0
                     - energies[3] / 12.0)
-                    / self.delta;
+                    / self.delta
+                    / ANGSTROM;
             }
         }
         gradients
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_numerical_gradient_is_scaled_to_bohr() {
+        let geom = Geometry::from_atoms(vec![("H", [1.0, 0.0, 0.0])], None);
+        let mut solver = GenericSolver::new(
+            |atoms, _| atoms[0].1[0] * ANGSTROM,
+            1e-4,
+        );
+
+        let (_energy, gradients) = solver.compute(&geom);
+
+        assert!((gradients[0][0] - 1.0).abs() < 1e-8);
+        assert!(gradients[0][1].abs() < 1e-8);
+        assert!(gradients[0][2].abs() < 1e-8);
     }
 }

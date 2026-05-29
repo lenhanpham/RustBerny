@@ -2,13 +2,14 @@
 //!
 //! Supports both energy minimization and transition state search.
 
-use crate::coords::InternalCoords;
+use crate::coords::{Angle, Bond, Dihedral, InternalCoord, InternalCoords};
 use crate::geometry::Geometry;
 use crate::hessian;
 use crate::math;
 use crate::step;
 use crate::trust;
 use nalgebra::{DMatrix, DVector};
+use std::collections::HashMap;
 
 /// Optimizer mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +161,29 @@ impl Berny {
     pub fn send(&mut self, result: (f64, Vec<Vec<f64>>, Option<Vec<Vec<f64>>>)) {
         let (energy, gradients, cartesian_hessian) = result;
         let s = &mut self.state;
+
+        // Rebuild the internal-coordinate system when linear-bend topology has
+        // changed since the current coordinate set was constructed.
+        if !s.first && s.coords.needs_rebuild(&s.geom) {
+            let old_h = s.h.clone();
+            let old_coords = std::mem::replace(
+                &mut s.coords,
+                InternalCoords::new(&s.geom, s.params.dihedral, s.params.superweak_dih),
+            );
+            let guess_h = s.coords.hessian_guess(&s.geom);
+            s.h = carry_over_hessian(old_coords.all_coords(), &old_h, s.coords.all_coords(), &guess_h);
+            s.weights = s.coords.weights(&s.geom);
+            s.future = OptPoint {
+                q: s.coords.eval_geom(&s.geom, None),
+                e: None,
+                g: None,
+            };
+            s.first = true;
+            s.interpolated = None;
+            s.predicted = None;
+            s.previous = None;
+            s.best = None;
+        }
 
         let g_flat: Vec<f64> = gradients
             .iter()
@@ -331,6 +355,46 @@ impl Iterator for Berny {
         self.n += 1;
         Some(self.state.geom.clone())
     }
+}
+
+fn coord_key(coord: &dyn InternalCoord) -> (u8, Vec<usize>) {
+    let kind = if coord.as_any().is::<Bond>() {
+        0
+    } else if coord.as_any().is::<Angle>() {
+        1
+    } else if coord.as_any().is::<Dihedral>() {
+        2
+    } else {
+        255
+    };
+    (kind, coord.idx())
+}
+
+fn carry_over_hessian(
+    old_coords: &[Box<dyn InternalCoord>],
+    old_h: &DMatrix<f64>,
+    new_coords: &[Box<dyn InternalCoord>],
+    guess_h: &DMatrix<f64>,
+) -> DMatrix<f64> {
+    let old_pos: HashMap<(u8, Vec<usize>), usize> = old_coords
+        .iter()
+        .enumerate()
+        .map(|(i, coord)| (coord_key(coord.as_ref()), i))
+        .collect();
+
+    let pairs: Vec<(usize, usize)> = new_coords
+        .iter()
+        .enumerate()
+        .filter_map(|(new_i, coord)| old_pos.get(&coord_key(coord.as_ref())).map(|&old_i| (new_i, old_i)))
+        .collect();
+
+    let mut h = guess_h.clone();
+    for &(new_i, old_i) in &pairs {
+        for &(new_j, old_j) in &pairs {
+            h[(new_i, new_j)] = old_h[(old_i, old_j)];
+        }
+    }
+    h
 }
 
 /// Performs a 1-D linear search between `current` (t=0) and `best` (t=1) by
