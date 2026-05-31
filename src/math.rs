@@ -128,7 +128,6 @@ pub fn fit_cubic(y0: f64, y1: f64, g0: f64, g1: f64) -> (Option<f64>, Option<f64
 
     // For a cubic a*x^3+..., when a>0 the cubic rises left→right:
     // the smaller (leftmost) critical point is a local MAX and the larger is the MIN.
-    // Python: `if p[0] > 0: maxim, minim = r_sorted` (maxim = r_sorted[0] = smaller).
     let (maxim, minim) = if a > 0.0 {
         (r_sorted[0], r_sorted[1])
     } else {

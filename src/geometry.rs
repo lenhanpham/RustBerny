@@ -201,7 +201,6 @@ impl Geometry {
         for i in 0..n {
             for j in 0..n {
                 if i == j {
-                    // Python sets dist[diagonal] = inf, so rho[i,i] = exp(-inf/r+1) = 0.
                     rho[(i, j)] = 0.0;
                 } else {
                     let d = dist[(i, j)];

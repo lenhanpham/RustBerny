@@ -199,7 +199,6 @@ impl Berny {
         let b_inv = &b_t * math::pinv(&bbt, &|_| {});
 
         // g_int = B_inv^T @ g_cart = pinv(B@B^T) @ B @ g_cart
-        // Python: dot(B_inv.T, gradients.reshape(-1))
         let g_int = b_inv.transpose() * &g_vec;
 
         // Current point in internal-coordinate space
@@ -209,9 +208,9 @@ impl Berny {
             g: Some(g_int.clone()),
         };
 
-        // --- Handle first-step initial Cartesian Hessian for TS mode ---
+        // --- Handle first-step initial Cartesian Hessian ---
         let mut skip_hessian_update = false;
-        if s.first && s.params.mode == Mode::Ts {
+        if s.first {
             if let Some(ref cart_h) = cartesian_hessian {
                 let n_atoms = s.geom.len();
                 let expected = 3 * n_atoms;
@@ -227,6 +226,27 @@ impl Berny {
                     skip_hessian_update = true;
                 }
             }
+
+            // For TS searches without an external Hessian, the diagonal guess
+            // has all-positive eigenvalues.  Flip one to negative so P-RFO has
+            // a well-defined ascent direction from the first step.
+            if s.params.mode == Mode::Ts && !skip_hessian_update {
+                let eig = s.h.clone().symmetric_eigen();
+                let n = eig.eigenvalues.len();
+                if n > 0 {
+                    // Find the smallest (most softly restrained) eigenvalue.
+                    let mut idx: Vec<usize> = (0..n).collect();
+                    idx.sort_by(|&a, &b| {
+                        eig.eigenvalues[a]
+                            .partial_cmp(&eig.eigenvalues[b])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let min_i = idx[0];
+                    let v = eig.eigenvectors.column(min_i);
+                    let neg_val = -0.2_f64.max(eig.eigenvalues[min_i].abs());
+                    s.h += (neg_val - eig.eigenvalues[min_i]) * v * v.transpose();
+                }
+            }
         }
 
         // --- Hessian update (uses un-projected s.h) ---
@@ -238,12 +258,19 @@ impl Berny {
                 let dg_step = g_int.clone() - prev.g.clone().unwrap();
                 s.h = hessian::update_hessian_ts(&s.h, &dq_step, &dg_step);
             } else {
-                // Min: secant pair from best → current
-                let best = s.best.as_ref().unwrap();
-                let dq_step = current.q.clone() - &best.q;
-                let dg_step = g_int.clone() - best.g.clone().unwrap();
+                // Min: secant pair from previous → current (consecutive steps)
+                let prev = s.previous.as_ref().unwrap();
+                let dq_step = current.q.clone() - &prev.q;
+                let dg_step = g_int.clone() - prev.g.clone().unwrap();
                 s.h = hessian::update_bfgs(&s.h, &dq_step, &dg_step);
             }
+        }
+
+        // Periodic eigenvalue correction for TS search: enforce exactly one
+        // negative eigenvalue every 3 cycles so the quasi-Newton updates
+        // don't drift away from the saddle-point signature.
+        if !s.first && s.params.mode == Mode::Ts && self.n % 3 == 0 {
+            ensure_one_negative_eigenvalue(&mut s.h, 0.1);
         }
 
         // --- Trust-radius update ---
@@ -284,6 +311,8 @@ impl Berny {
         let h_proj =
             &proj * &s.h * &proj + 1000.0 * (DMatrix::identity(n_coords, n_coords) - &proj);
         let h_proj = (&h_proj + &h_proj.transpose()) / 2.0;
+        // Ensure positive-definite spectrum before step computation
+        let h_proj = hessian::force_positive_definite(&h_proj, 1e-4);
 
         // --- Quadratic step ---
         let interp = s.interpolated.as_ref().unwrap();
@@ -314,7 +343,6 @@ impl Berny {
         s.previous = Some(current.clone());
 
         // TS always advances best; for minimisation track lowest energy.
-        // Python: "Fix 4"
         if s.params.mode == Mode::Ts
             || s.first
             || s.best.as_ref().map_or(true, |b| b.e.map_or(true, |be| energy < be))
@@ -395,6 +423,44 @@ fn carry_over_hessian(
         }
     }
     h
+}
+
+/// Enforce exactly one negative eigenvalue on the Hessian by spectral
+/// adjustment.  Used periodically during TS searches to prevent the
+/// quasi-Newton update from drifting away from the saddle-point signature.
+///
+/// The smallest eigenvalue is pushed to `-epsilon` if not already negative.
+/// Any extra negative eigenvalues are flipped to `+epsilon`.
+fn ensure_one_negative_eigenvalue(h: &mut DMatrix<f64>, epsilon: f64) {
+    let eig = h.clone().symmetric_eigen();
+    let n = eig.eigenvalues.len();
+    if n == 0 {
+        return;
+    }
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| {
+        eig.eigenvalues[a]
+            .partial_cmp(&eig.eigenvalues[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let n_neg = eig.eigenvalues.iter().filter(|&&v| v < 0.0).count();
+
+    if n_neg != 1 || eig.eigenvalues[idx[0]] > -(epsilon / 2.0) {
+        // Ensure lowest eigenvalue is at most -epsilon.
+        let i0 = idx[0];
+        let target = -epsilon;
+        if eig.eigenvalues[i0] > target {
+            let v = eig.eigenvectors.column(i0);
+            *h += (target - eig.eigenvalues[i0]) * v * v.transpose();
+        }
+    }
+
+    for i in &idx[1..] {
+        if eig.eigenvalues[*i] < epsilon / 2.0 {
+            let v = eig.eigenvectors.column(*i);
+            *h += (epsilon - eig.eigenvalues[*i]) * v * v.transpose();
+        }
+    }
 }
 
 /// Performs a 1-D linear search between `current` (t=0) and `best` (t=1) by

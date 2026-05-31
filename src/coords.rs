@@ -754,7 +754,7 @@ impl InternalCoords {
 
         for &(j, i, k) in linear_set.iter() {
             if is_sp_like_centre(&bondmatrix, j) {
-                // Create two perpendicular reference directions
+                 // Create two perpendicular basis directions
                 let axis = super_geom.coords[k] - super_geom.coords[i];
                 let n_axis = axis.norm();
                 let axis_hat = axis / n_axis;
@@ -792,7 +792,7 @@ impl InternalCoords {
             }
         }
 
-        // Add dihedrals (only if the dihedral flag is set, matching Python behaviour)
+        // Add dihedrals (only if the dihedral flag is set)
         if dihedral {
             let mut all_dihedrals = Vec::new();
             for coord in &coords {
@@ -919,7 +919,7 @@ impl InternalCoords {
             })
             .collect();
 
-        // --- Dihedral unwrapping (Python `eval_geom` with template) ---
+        // --- Dihedral unwrapping---
         if let Some(template) = template {
             use std::collections::HashSet;
             use std::f64::consts::PI;
@@ -1032,11 +1032,12 @@ impl InternalCoords {
         }
 
         // Flatten to (n_coords, 3*n_real)
+        // Multiply by ANGSTROM to get correct units: B = ∂q(Bohr)/∂R(Å)
         let mut result = DMatrix::zeros(n_coords, 3 * n_real);
         for i in 0..n_coords {
             for j in 0..n_real {
                 for k in 0..3 {
-                    result[(i, 3 * j + k)] = b[i][j][k];
+                    result[(i, 3 * j + k)] = b[i][j][k] * ANGSTROM;
                 }
             }
         }
@@ -1097,12 +1098,15 @@ impl InternalCoords {
     }
 
     /// Updates geometry from internal coordinate step.
+    ///
+    /// Uses iterative back-transformation: at each iteration, recomputes the
+    /// B-matrix at the current geometry and solves for the Cartesian displacement.
     pub fn update_geom(
         &mut self,
         geom: &Geometry,
         q: &DVector<f64>,
         dq: &DVector<f64>,
-        b_inv: &DMatrix<f64>,
+        _b_inv: &DMatrix<f64>,
     ) -> (DVector<f64>, Geometry) {
         let mut geom = geom.clone();
         let thre = 1e-6;
@@ -1111,14 +1115,21 @@ impl InternalCoords {
         let mut dq = dq.clone();
 
         for i in 0..20 {
+            // Recompute B-matrix and pseudoinverse at current geometry
+            let b = self.b_matrix(&geom);
+            let b_t = b.transpose();
+            let bbt = &b * &b_t;
+            let b_inv = &b_t * math::pinv(&bbt, &|_| {});
+
             let dq_flat = b_inv * &dq;
+            // d is in Angstrom (same units as geom.coords), no division needed
             let coords_new: Vec<Vector3<f64>> = geom
                 .coords
                 .iter()
                 .enumerate()
                 .map(|(j, c)| {
                     let d = Vector3::new(dq_flat[3 * j], dq_flat[3 * j + 1], dq_flat[3 * j + 2]);
-                    c + d / ANGSTROM
+                    c + d
                 })
                 .collect();
 
@@ -1133,8 +1144,6 @@ impl InternalCoords {
             geom.coords = coords_new;
             let q_new = self.eval_geom(&geom, Some(&q));
             let dq_rms = math::rms_vec(&(q_new.clone() - &q));
-            // Python: q, dq = q_new, dq - (q_new - q)
-            // i.e. new remaining displacement = old dq minus the actual q change.
             let q_old = q.clone();
             q = q_new;
             dq = dq - (&q - &q_old);
