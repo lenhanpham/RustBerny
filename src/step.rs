@@ -78,16 +78,37 @@ pub fn quadratic_step(
     (dq_out, d_e, on_sphere)
 }
 
-/// Computes the P-RFO step for transition state search.
+/// Computes the partitioned-RFO (P-RFO) step for a transition-state search.
 ///
-/// Maximizes along the transition vector (lowest eigenvector of H) and
-/// minimizes in the orthogonal complement.
+/// Implements the partitioned rational-function optimization of Banerjee,
+/// Adams, Simons and Shepard (*J. Phys. Chem.* **1985**, *89*, 52-57) with
+/// eigenvector following. The Hessian eigenvectors are split into a one-
+/// dimensional "ascent" subspace (the reaction coordinate) and the orthogonal
+/// "descent" subspace:
+///
+/// * The reaction-coordinate mode is shifted by the **upper** RFO root
+///   `λ_p = (b_p + √(b_p² + 4 F_p²)) / 2 ≥ b_p`, so the step climbs that mode.
+/// * Every remaining mode shares the **lower** RFO root `λ_n`, the lowest root
+///   of the secular equation `λ = Σ_i F_i² / (λ − b_i)` taken over the descent
+///   subspace, so those modes are minimized.
+///
+/// The step component along eigenvector `i` is `h_i = F_i / (λ − b_i)` where
+/// `F_i = vᵢ·g` and `λ` is the shift assigned to that mode. The total step is
+/// scaled uniformly into the trust radius when it would otherwise exceed it.
+///
+/// `tracked` carries the reaction-coordinate eigenvector between cycles: the
+/// ascended mode is the eigenvector of maximum overlap with `tracked` (or the
+/// lowest mode when `tracked` is `None`), and on return it is updated
+/// (sign-aligned) to the mode that was climbed. This eigenvector following keeps
+/// the search on the same reaction coordinate instead of whichever mode is
+/// momentarily lowest.
 ///
 /// # Arguments
 /// * `g` - Projected gradient in internal coordinates
-/// * `h` - Projected Hessian in internal coordinates
-/// * `_w` - Coordinate weights
+/// * `h` - Projected (indefinite) Hessian in internal coordinates
+/// * `_w` - Coordinate weights (reserved for future use)
 /// * `trust` - Trust radius
+/// * `tracked` - Reaction-coordinate tracker (seeded on the first call)
 ///
 /// # Returns
 /// `(dq, dE, on_sphere)` — step, predicted energy change, whether on trust sphere.
@@ -96,84 +117,113 @@ pub fn quadratic_step_ts(
     h: &DMatrix<f64>,
     _w: &DVector<f64>,
     trust: f64,
+    tracked: &mut Option<DVector<f64>>,
 ) -> (DVector<f64>, f64, bool) {
     let n = g.len();
+    if n == 0 {
+        return (DVector::zeros(0), 0.0, false);
+    }
 
-    // Eigendecompose H → ev ascending, V columns
+    // Diagonalize the symmetric Hessian.
     let h_sym = (h + h.transpose()) / 2.0;
     let eig = h_sym.clone().symmetric_eigen();
-    let ev = eig.eigenvalues;
+    let b = eig.eigenvalues; // ascending order from symmetric_eigen
     let v = eig.eigenvectors;
 
-    // Transition vector (lowest eigenvector)
-    let v0 = v.column(0).clone_owned();
-    let v_rest = v.columns(1, n - 1).clone_owned();
+    // Gradient in the eigenbasis: F_i = v_i · g.
+    let f = v.transpose() * g;
 
-    // --- Uphill RFO along transition vector ---
-    let g0 = v0.dot(g);
-    let mut rfo_ts = DMatrix::zeros(2, 2);
-    rfo_ts[(0, 0)] = ev[0];
-    rfo_ts[(0, 1)] = g0;
-    rfo_ts[(1, 0)] = g0;
-    let rfo_ts_sym = (&rfo_ts + &rfo_ts.transpose()) / 2.0;
-    let eig_ts = rfo_ts_sym.symmetric_eigen();
-    let t0 = eig_ts.eigenvectors[(0, 1)] / eig_ts.eigenvectors[(1, 1)];
-
-    // --- Downhill RFO in orthogonal complement ---
-    let g_rest = v_rest.transpose() * g;
-    let mut rfo_rest = DMatrix::zeros(n, n);
-    for i in 0..(n - 1) {
-        rfo_rest[(i, i)] = ev[i + 1];
-    }
-    for i in 0..(n - 1) {
-        rfo_rest[(i, n - 1)] = g_rest[i];
-        rfo_rest[(n - 1, i)] = g_rest[i];
-    }
-    let rfo_rest_sym = (&rfo_rest + &rfo_rest.transpose()) / 2.0;
-    let eig_rest = rfo_rest_sym.symmetric_eigen();
-    let t_rest = eig_rest.eigenvectors.column(0).rows(0, n - 1).clone_owned()
-        / eig_rest.eigenvectors[(n - 1, 0)];
-
-    // Assemble full step
-    let mut dq = &v0 * t0 + &v_rest * &t_rest;
-    let step_norm = dq.norm();
-
-    let mut on_sphere = false;
-
-    // Trust radius constraint
-    if step_norm > trust {
-        let ev_rest = ev.rows(1, n - 1).clone_owned();
-        let ev_rest_shifted = ev_rest.clone();
-        let steplength = |l: f64| -> f64 {
-            let t0_l = g0 / (ev[0] - l);
-            let mut dq_l = &v0 * t0_l;
-            if n > 1 {
-                let shifted = DVector::from_fn(n - 1, |i, _| ev_rest_shifted[i] - l);
-                let t_rest_l = g_rest.clone().component_div(&shifted);
-                dq_l += &v_rest * &t_rest_l;
-            }
-            dq_l.norm() - trust
-        };
-
-        match math::findroot(steplength, ev[0]) {
-            Ok(l_opt) => {
-                let t0_s = g0 / (ev[0] - l_opt);
-                dq = &v0 * t0_s;
-                if n > 1 {
-                    // MINUS SIGN critical: downhill opposes gradient
-                    let shifted = DVector::from_fn(n - 1, |i, _| ev_rest[i] - l_opt);
-                    let t_rest_s = &g_rest.component_div(&shifted) * -1.0;
-                    dq += &v_rest * &t_rest_s;
+    // Pick the reaction-coordinate (ascent) mode by maximum overlap with the
+    // tracked eigenvector; fall back to the lowest-curvature mode.
+    let ascent = match tracked.as_ref() {
+        Some(prev) if prev.len() == n => {
+            let mut best = 0usize;
+            let mut best_ovlp = -1.0_f64;
+            for k in 0..n {
+                let ovlp = v.column(k).dot(prev).abs();
+                if ovlp > best_ovlp {
+                    best_ovlp = ovlp;
+                    best = k;
                 }
-                on_sphere = true;
             }
-            Err(_) => {
-                // Fallback: uniform rescaling
-                dq = &dq * (trust / step_norm);
-                on_sphere = true;
+            best
+        }
+        _ => 0,
+    };
+
+    // Upper RFO root for the ascended mode.
+    let b_p = b[ascent];
+    let f_p = f[ascent];
+    let lambda_p = 0.5 * (b_p + (b_p * b_p + 4.0 * f_p * f_p).sqrt());
+
+    // Lower RFO root shared by the descent subspace: the lowest root of
+    // λ = Σ_{i≠ascent} F_i² / (λ − b_i), which lies below the smallest descent
+    // eigenvalue. Solved by monotone bisection (the secular function
+    // g(λ) = λ − Σ F_i²/(λ − b_i) is strictly increasing for λ < min b_i).
+    let descent: Vec<usize> = (0..n).filter(|&i| i != ascent).collect();
+    let lambda_n = if descent.is_empty() {
+        0.0
+    } else {
+        let min_b = descent.iter().map(|&i| b[i]).fold(f64::INFINITY, f64::min);
+        let secular = |lam: f64| -> f64 {
+            let mut acc = lam;
+            for &i in &descent {
+                acc -= f[i] * f[i] / (lam - b[i]);
+            }
+            acc
+        };
+        // Bracket: hi just below the lowest descent eigenvalue (and below 0),
+        // lo far enough negative that the secular function is negative.
+        let hi = min_b.min(0.0) - 1e-9;
+        let mut lo = hi - 1.0;
+        let mut safety = 0;
+        while secular(lo) > 0.0 && safety < 200 {
+            lo -= lo.abs() + 1.0;
+            safety += 1;
+        }
+        let mut a = lo;
+        let mut c = hi;
+        for _ in 0..200 {
+            let m = 0.5 * (a + c);
+            if secular(m) > 0.0 {
+                c = m;
+            } else {
+                a = m;
+            }
+            if (c - a).abs() < 1e-14 * (1.0 + c.abs()) {
+                break;
             }
         }
+        0.5 * (a + c)
+    };
+
+    // Step components h_i = F_i / (λ − b_i) in the eigenbasis.
+    let mut h_eig = DVector::zeros(n);
+    for i in 0..n {
+        let lam = if i == ascent { lambda_p } else { lambda_n };
+        let denom = lam - b[i];
+        h_eig[i] = if denom.abs() > 1e-14 { f[i] / denom } else { 0.0 };
     }
+
+    // Transform back to the coordinate basis.
+    let mut dq = &v * &h_eig;
+
+    // Trust-radius constraint: uniform scaling into the sphere.
+    let mut on_sphere = false;
+    let step_norm = dq.norm();
+    if step_norm > trust && step_norm > 1e-14 {
+        dq *= trust / step_norm;
+        on_sphere = true;
+    }
+
+    // Update the tracked reaction coordinate (sign-aligned to the previous one).
+    let mut tv = v.column(ascent).clone_owned();
+    if let Some(prev) = tracked.as_ref() {
+        if prev.len() == n && tv.dot(prev) < 0.0 {
+            tv = -tv;
+        }
+    }
+    *tracked = Some(tv);
 
     let d_e = g.dot(&dq) + 0.5 * dq.dot(&(&h_sym * &dq));
     (dq, d_e, on_sphere)
@@ -199,9 +249,47 @@ mod tests {
         let g = DVector::from_vec(vec![0.1, 0.2]);
         let w = DVector::from_vec(vec![1.0, 1.0]);
 
-        let (dq, _d_e, on_sphere) = quadratic_step_ts(&g, &h, &w, 10.0);
+        let mut tracked = None;
+        let (dq, _d_e, on_sphere) = quadratic_step_ts(&g, &h, &w, 10.0, &mut tracked);
         assert!(!on_sphere);
         // Step should have finite norm
         assert!(dq.norm() > 0.0);
+        assert!(dq.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_prfo_converges_to_quadratic_saddle() {
+        // E = -0.5 x^2 + 0.5 y^2 + 0.5 z^2 has an order-1 saddle at the origin.
+        // Exact Hessian = diag(-1, 1, 1); gradient = (-x, y, z).
+        let h = DMatrix::from_diagonal(&DVector::from_vec(vec![-1.0, 1.0, 1.0]));
+        let w = DVector::from_element(3, 1.0);
+        let mut x = DVector::from_vec(vec![0.7, -0.5, 0.3]);
+        let mut tracked = None;
+        for _ in 0..100 {
+            let g = DVector::from_vec(vec![-x[0], x[1], x[2]]);
+            if g.norm() < 1e-9 {
+                break;
+            }
+            let (dq, _de, _on) = quadratic_step_ts(&g, &h, &w, 0.5, &mut tracked);
+            x += dq;
+        }
+        assert!(x.norm() < 1e-6, "P-RFO should reach the saddle, |x|={}", x.norm());
+    }
+
+    #[test]
+    fn test_prfo_ascends_reaction_mode_descends_rest() {
+        // At a point off the saddle, the step must increase energy along the
+        // negative-curvature mode (x) and decrease it along the rest.
+        let h = DMatrix::from_diagonal(&DVector::from_vec(vec![-1.0, 2.0, 2.0]));
+        let w = DVector::from_element(3, 1.0);
+        let x = DVector::from_vec(vec![0.4, 0.4, 0.4]);
+        let g = DVector::from_vec(vec![-x[0], 2.0 * x[1], 2.0 * x[2]]);
+        let mut tracked = None;
+        let (dq, _de, _on) = quadratic_step_ts(&g, &h, &w, 10.0, &mut tracked);
+        // Reaction coordinate (x) steps toward the saddle (sign opposite to x).
+        assert!(dq[0] * x[0] < 0.0, "ascent mode should move toward saddle: {dq:?}");
+        // The tracked mode should align with the negative-curvature axis.
+        let tv = tracked.unwrap();
+        assert!(tv[0].abs() > 0.99, "tracked reaction coordinate should follow x: {tv:?}");
     }
 }

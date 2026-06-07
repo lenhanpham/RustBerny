@@ -73,6 +73,7 @@ pub struct OptPoint {
 /// Mutable optimizer state.
 struct BernyState {
     geom: Geometry,
+    prev_geom: Geometry,
     params: BernyParams,
     trust: f64,
     coords: InternalCoords,
@@ -84,6 +85,8 @@ struct BernyState {
     predicted: Option<OptPoint>,
     previous: Option<OptPoint>,
     best: Option<OptPoint>,
+    /// Reaction-coordinate eigenvector followed across cycles in TS mode.
+    ts_mode: Option<DVector<f64>>,
 }
 
 /// Geometry optimizer using rational function optimization.
@@ -110,9 +113,12 @@ impl Berny {
             g: None,
         };
 
+        let prev_geom = geom.clone();
+
         Self {
             state: BernyState {
                 geom,
+                prev_geom,
                 params,
                 trust,
                 coords,
@@ -124,6 +130,7 @@ impl Berny {
                 predicted: None,
                 previous: None,
                 best: None,
+                ts_mode: None,
             },
             n: 0,
             maxsteps,
@@ -148,7 +155,6 @@ impl Berny {
 
     /// Processes solver output.
     ///
-    /// Matches the `Berny.send()` algorithm exactly:
     /// 1. B-matrix and pseudoinverse
     /// 2. Internal-coordinate gradient: `g_int = B_inv^T @ g_cart`
     /// 3. Hessian update (BFGS / TS flowchart) using un-projected H
@@ -161,6 +167,8 @@ impl Berny {
     pub fn send(&mut self, result: (f64, Vec<Vec<f64>>, Option<Vec<Vec<f64>>>)) {
         let (energy, gradients, cartesian_hessian) = result;
         let s = &mut self.state;
+
+        s.prev_geom = s.geom.clone();
 
         // Rebuild the internal-coordinate system when linear-bend topology has
         // changed since the current coordinate set was constructed.
@@ -274,6 +282,7 @@ impl Berny {
         }
 
         // --- Trust-radius update ---
+        let mut step_rejected = false;
         if !s.first {
             let prev = s.previous.as_ref().unwrap();
             let pred = s.predicted.as_ref().unwrap();
@@ -283,6 +292,10 @@ impl Berny {
             let dq_norm = (&pred.q - &interp.q).norm();
             s.trust =
                 trust::update_trust(s.trust, d_e, d_e_pred, dq_norm, s.params.energy_noise);
+
+            if s.params.mode == Mode::Min && d_e > 0.0 {
+                step_rejected = true;
+            }
         }
 
         // --- Linear search (minimisation only) ---
@@ -311,14 +324,25 @@ impl Berny {
         let h_proj =
             &proj * &s.h * &proj + 1000.0 * (DMatrix::identity(n_coords, n_coords) - &proj);
         let h_proj = (&h_proj + &h_proj.transpose()) / 2.0;
-        // Ensure positive-definite spectrum before step computation
-        let h_proj = hessian::force_positive_definite(&h_proj, 1e-4);
+        // Condition the spectrum before the step. Minimization needs a
+        // positive-definite model, but a transition-state search *requires* the
+        // indefinite Hessian: P-RFO ascends the single negative-curvature mode
+        // (the reaction coordinate). Forcing positive-definiteness here would
+        // erase that mode and collapse the search into a plain minimization.
+        let h_proj = if s.params.mode == Mode::Ts {
+            h_proj
+        } else {
+            hessian::force_positive_definite(&h_proj, 1e-4)
+        };
 
         // --- Quadratic step ---
         let interp = s.interpolated.as_ref().unwrap();
         let g_proj = &proj * interp.g.as_ref().unwrap();
         let (dq, d_e, on_sphere) = if s.params.mode == Mode::Ts {
-            step::quadratic_step_ts(&g_proj, &h_proj, &s.weights, s.trust)
+            let mut tracked = s.ts_mode.take();
+            let out = step::quadratic_step_ts(&g_proj, &h_proj, &s.weights, s.trust, &mut tracked);
+            s.ts_mode = tracked;
+            out
         } else {
             step::quadratic_step(&g_proj, &h_proj, &s.weights, s.trust)
         };
@@ -332,20 +356,30 @@ impl Berny {
         let total_dq = &s.predicted.as_ref().unwrap().q - &current.q;
 
         // --- Geometry update ---
-        let (_q_new, geom_new) = s.coords.update_geom(&s.geom, &current.q, &total_dq, &b_inv);
-        s.geom = geom_new;
-        s.future = OptPoint {
-            q: s.coords.eval_geom(&s.geom, None),
-            e: None,
-            g: None,
-        };
-
-        s.previous = Some(current.clone());
+        if step_rejected {
+            s.geom = s.prev_geom.clone();
+            s.future = OptPoint {
+                q: s.coords.eval_geom(&s.geom, None),
+                e: None,
+                g: None,
+            };
+        } else {
+            let (_q_new, geom_new) =
+                s.coords.update_geom(&s.geom, &current.q, &total_dq, &b_inv);
+            s.geom = geom_new;
+            s.future = OptPoint {
+                q: s.coords.eval_geom(&s.geom, None),
+                e: None,
+                g: None,
+            };
+            s.previous = Some(current.clone());
+        }
 
         // TS always advances best; for minimisation track lowest energy.
-        if s.params.mode == Mode::Ts
-            || s.first
-            || s.best.as_ref().map_or(true, |b| b.e.map_or(true, |be| energy < be))
+        if !step_rejected
+            && (s.params.mode == Mode::Ts
+                || s.first
+                || s.best.as_ref().map_or(true, |b| b.e.map_or(true, |be| energy < be)))
         {
             s.best = Some(current.clone());
         }
